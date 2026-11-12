@@ -42,6 +42,32 @@ TOKEN_TTL = int(os.environ.get("TOKEN_TTL", "3600"))
 BASE_URL = os.environ.get("BASE_URL", f"http://oai-source:{PORT}/oai")
 
 
+def _subjects_for(i: int) -> list[str]:
+    """按编号确定性地分配 dc:subject，覆盖主题导航的各类场景。
+
+    - 旧词/新词混用：电脑、计算机 -> 信息技术；机械、机械工程 -> 工程技术；
+      医学、医药 -> 医药卫生
+    - rec-016 同一条书目同时带“电脑/计算机”两个原词，归入同一主题只计一次
+    - rec-020 带未收录原词“杂项”，不计入任何主题
+    - rec-024 同时属于两个标准主题，两个主题各计一次
+    - rec-013 为删除记录，撤下后不计
+    """
+    if i == 13:
+        return ["医学"]
+    if i == 16:
+        return ["电脑", "计算机"]
+    if i == 20:
+        return ["杂项"]
+    if i == 24:
+        return ["计算机", "机械"]
+    group = (i - 1) % 3
+    if group == 0:
+        return ["电脑" if i % 2 == 0 else "计算机"]
+    if group == 1:
+        return ["机械" if i % 2 == 0 else "机械工程"]
+    return ["医学" if i % 2 == 0 else "医药"]
+
+
 def _build_records() -> list[dict]:
     """生成 27 条确定性的样例书目，其中 rec-013 为已删除记录。"""
     records = []
@@ -58,6 +84,7 @@ def _build_records() -> list[dict]:
                 "date": datestamp,
                 "dc_identifier": f"ISBN 978-7-0000-{i:04d}-X",
                 "type": "text",
+                "subjects": _subjects_for(i),
             }
         )
     return records
@@ -177,6 +204,9 @@ def _record_element(parent: ET.Element, record: dict) -> None:
         ("type", record["type"]),
     ):
         ET.SubElement(dc_el, f"{{{DC_NS}}}{tag}").text = value
+    # dc:subject 为多值字段，原样输出全部原词（旧词/新词混用由采集端归一）
+    for subject in record.get("subjects", []):
+        ET.SubElement(dc_el, f"{{{DC_NS}}}subject").text = subject
 
 
 def _filter_records(from_date: str | None, until_date: str | None) -> list[dict]:

@@ -5,26 +5,24 @@
    （上次成功采集的截止日，含当天），实现无缝续采。
 2. ListRecords 按日期拉取 oai_dc，续页仅用 resumptionToken。
 3. resumptionToken 失效（badResumptionToken）时丢弃已取页，按原区间整体重抓一次。
-4. 所有页取完后，在单个 SQLite 事务内 upsert/撤下书目并推进截止日；
-   无匹配记录同样推进截止日。事务失败则整批回滚，进度不变。
+4. 所有页取完后，在单个 SQLite 事务内 upsert/撤下书目、按本批书目前后主题差集
+   增量维护主题计数，并推进截止日；无匹配记录同样推进截止日。
+   事务失败则整批回滚，书目、计数、进度都不变。
 """
 from __future__ import annotations
 
 import json
 import logging
-import threading
 from dataclasses import dataclass
 
 from . import db
+from .locking import WRITE_LOCK, WriteConflictError
 from .oai_client import OAIClient, OAIError, OAIRecord
 
 logger = logging.getLogger("harvester")
 
-# 进程内互斥：同一时刻只允许一个采集任务，避免进度竞争
-_HARVEST_LOCK = threading.Lock()
 
-
-class HarvestConflictError(RuntimeError):
+class HarvestConflictError(WriteConflictError):
     pass
 
 
@@ -105,13 +103,13 @@ def _fetch_full_window(client: OAIClient, from_date: str | None,
 def harvest(client: OAIClient, *, until_date: str,
             from_date: str | None) -> HarvestSummary:
     """执行一次采集。from_date 为 None 时从上次成功截止日续采。"""
-    if not _HARVEST_LOCK.acquire(blocking=False):
+    if not WRITE_LOCK.acquire(blocking=False):
         raise HarvestConflictError("已有采集任务正在执行，请稍后再试")
     try:
         return _harvest_locked(client, until_date=until_date,
                                from_date=from_date)
     finally:
-        _HARVEST_LOCK.release()
+        WRITE_LOCK.release()
 
 
 def _harvest_locked(client: OAIClient, *, until_date: str,
@@ -138,8 +136,17 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
 
         # 整批落库：单事务，任何异常整体回滚，半批数据不会入库
         with db.transaction(conn):
+            # 补采期间持有写锁，词表不会被换表改动；计数随本批一起提交
+            mapping = db.get_subject_mapping(conn)
+            mapping_exists = bool(mapping)
+
             inserted = updated = withdrawn = 0
             for record in records:
+                # 先取变更前快照：在架状态 + 已挂的标准主题（增量只看本批书目）
+                old_status, old_subjects = db.get_record_snapshot(
+                    conn, record.identifier
+                )
+
                 if record.deleted:
                     # 遇删除标记就撤下；库中不存在则落 withdrawn 墓碑
                     if db.withdraw_bib_record(
@@ -153,18 +160,44 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
                             datestamp=record.datestamp,
                         )
                         withdrawn += 1
+                    # 撤下：按该书目旧主题逐项减计数，不重扫全库
+                    db.sync_record_subjects(
+                        conn,
+                        identifier=record.identifier,
+                        new_status="withdrawn",
+                        new_subjects=set(),
+                        old_status=old_status,
+                        old_subjects=old_subjects,
+                        mapping_exists=mapping_exists,
+                    )
                     continue
+
+                raw_dc = json.dumps(record.dc, ensure_ascii=False)
                 outcome = db.upsert_bib_record(
                     conn,
                     identifier=record.identifier,
                     datestamp=record.datestamp,
                     fields=_first_values(record.dc),
-                    raw_dc=json.dumps(record.dc, ensure_ascii=False),
+                    raw_dc=raw_dc,
                 )
                 if outcome == "inserted":
                     inserted += 1
                 else:
                     updated += 1
+
+                # 在架：用完整多值 dc:subject 精确映射并去重，按前后差集调计数
+                new_subjects = db.map_subjects(
+                    db.extract_raw_subjects(raw_dc), mapping
+                )
+                db.sync_record_subjects(
+                    conn,
+                    identifier=record.identifier,
+                    new_status="active",
+                    new_subjects=new_subjects,
+                    old_status=old_status,
+                    old_subjects=old_subjects,
+                    mapping_exists=mapping_exists,
+                )
 
             db.advance_progress(conn, until_date)
             db.finish_run(

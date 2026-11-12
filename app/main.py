@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from . import db
 from .harvester import HarvestConflictError, harvest
+from .locking import WriteConflictError
 from .oai_client import OAIClient, OAIError
 from .schemas import (
     BibRecordOut,
@@ -16,7 +17,13 @@ from .schemas import (
     HarvestResponse,
     ProgressResponse,
     RunOut,
+    SubjectCountItem,
+    SubjectMappingOut,
+    SubjectMappingReplaceResponse,
+    SubjectMappingRequest,
+    SubjectNavigationResponse,
 )
+from .subjects import replace_mapping
 
 OAI_ENDPOINT = os.environ.get(
     "OAI_ENDPOINT", "http://oai-source:8080/oai"
@@ -32,12 +39,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="联合目录补采采集服务",
     description=(
-        "通过 OAI-PMH ListRecords(oai_dc) 按日期补采单馆书目。\n\n"
+        "通过 OAI-PMH ListRecords(oai_dc) 按日期补采单馆书目，并维护主题导航计数。\n\n"
         "- 首次采集另填起始日；之后从上次成功采集的截止日（含当天）续采\n"
         "- 续页只用 resumptionToken；令牌失效则丢弃已取页、按原区间重抓一次\n"
-        "- 整批采完才在一个事务内提交书目变更和截止日，无匹配也推进截止日"
+        "- 整批采完才在一个事务内提交书目变更、主题计数增量和截止日，无匹配也推进截止日\n"
+        "- PUT /api/v1/subject-mapping 提交原词→标准主题对照表，按全部在架书目\n"
+        "  完整 dc:subject 重建计数；同书目同主题只计一次，未收录原词不计\n"
+        "- GET /api/v1/subject-navigation 查询各标准主题的非零在架计数"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -189,3 +199,81 @@ def list_runs(limit: int = Query(20, ge=1, le=200)) -> list[RunOut]:
 @app.get("/health", tags=["系统"], summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.put(
+    "/api/v1/subject-mapping",
+    response_model=SubjectMappingReplaceResponse,
+    summary="提交主题对照表并按在架书目重建计数（换表）",
+    tags=["主题导航"],
+)
+def put_subject_mapping(
+    req: SubjectMappingRequest,
+) -> SubjectMappingReplaceResponse:
+    """馆员换词表：
+
+    - 请求体为 ``{dc:subject 原词: 标准主题}``，按原词精确匹配，未收录原词不计；
+    - 按全部在架书目的完整多值 ``dc:subject`` 重建主题索引与非零计数，
+      同一条书目在同一标准主题下只计一次；
+    - 词表与计数在同一事务内整体提交，失败全部回滚，原书目不做任何修改；
+    - 与补采互斥，撞单时返回 409。
+    """
+    try:
+        result = replace_mapping(req.mapping)
+    except WriteConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"换表失败，词表与计数均未提交（已回滚）：{exc}",
+        ) from exc
+    return SubjectMappingReplaceResponse(
+        status="success",
+        version=result.version,
+        entries=result.entries,
+        standard_subjects=result.standard_subjects,
+        active_records_indexed=result.active_records_indexed,
+        subject_counts=result.subject_counts,
+    )
+
+
+@app.get(
+    "/api/v1/subject-mapping",
+    response_model=SubjectMappingOut,
+    summary="查询当前生效的主题对照表",
+    tags=["主题导航"],
+)
+def get_subject_mapping() -> SubjectMappingOut:
+    conn = db.get_connection()
+    try:
+        return SubjectMappingOut(
+            version=db.get_mapping_version(conn),
+            mapping=db.get_subject_mapping(conn),
+        )
+    finally:
+        conn.close()
+
+
+@app.get(
+    "/api/v1/subject-navigation",
+    response_model=SubjectNavigationResponse,
+    summary="主题导航：各标准主题的在架书目非零计数",
+    tags=["主题导航"],
+)
+def get_subject_navigation() -> SubjectNavigationResponse:
+    """只返回计数非零的标准主题；同一书目在同一主题下只计一次。"""
+    conn = db.get_connection()
+    try:
+        rows = db.list_subject_counts(conn)
+        return SubjectNavigationResponse(
+            version=db.get_mapping_version(conn),
+            subjects=[
+                SubjectCountItem(
+                    standard_subject=row["standard_subject"],
+                    count=row["count"],
+                )
+                for row in rows
+            ],
+        )
+    finally:
+        conn.close()

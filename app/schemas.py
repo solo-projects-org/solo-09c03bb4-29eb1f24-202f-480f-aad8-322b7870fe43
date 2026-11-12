@@ -1,7 +1,7 @@
 """请求/响应模型。"""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class HarvestRequest(BaseModel):
@@ -51,6 +51,9 @@ class BibRecordOut(BaseModel):
     status: str
     title: str | None
     creator: str | None
+    subject: str | None = Field(
+        None, description="首个 dc:subject 原词；完整多值见原始记录"
+    )
     date: str | None
     identifier_dc: str | None
     updated_at: str
@@ -70,3 +73,72 @@ class RunOut(BaseModel):
     withdrawn: int
     retries: int
     error: str | None
+
+
+class SubjectMappingRequest(BaseModel):
+    """馆员提交的 JSON 对照表：键为 dc:subject 原词，值为标准主题。
+
+    原词精确匹配；未收录进对照表的原词不计入任何主题。
+    """
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "电脑": "信息技术",
+                    "计算机": "信息技术",
+                    "机械": "工程技术",
+                }
+            ]
+        }
+    }
+
+    mapping: dict[str, str]
+
+    @model_validator(mode="after")
+    def _validate_non_blank(self) -> "SubjectMappingRequest":
+        if not self.mapping:
+            raise ValueError("对照表不能为空，至少包含一条原词 -> 标准主题")
+        blanks = [
+            key for key, value in self.mapping.items()
+            if not key.strip() or not value.strip()
+        ]
+        if blanks:
+            raise ValueError("原词和标准主题都不能是空字符串或纯空白")
+        return self
+
+
+class SubjectMappingReplaceResponse(BaseModel):
+    status: str = Field("success", description="success / failed")
+    version: int = Field(..., description="换表后的词表版本（每次换表 +1）")
+    entries: int = Field(..., description="对照表条目数（不同原词数）")
+    standard_subjects: int = Field(..., description="对照表覆盖的标准主题数")
+    active_records_indexed: int = Field(
+        ..., description="重建后命中至少一个标准主题的在架书目数（去重后）"
+    )
+    subject_counts: dict[str, int] = Field(
+        ..., description="各标准主题的在架书目非零计数"
+    )
+
+
+class SubjectMappingOut(BaseModel):
+    version: int | None = Field(
+        None, description="当前词表版本；尚未提交过词表为 null"
+    )
+    mapping: dict[str, str] = Field(
+        ..., description="当前生效的对照表（原词 -> 标准主题）"
+    )
+
+
+class SubjectCountItem(BaseModel):
+    standard_subject: str = Field(..., description="标准主题")
+    count: int = Field(..., gt=0, description="该主题下去重后的在架书目数")
+
+
+class SubjectNavigationResponse(BaseModel):
+    version: int | None = Field(
+        None, description="计数对应的词表版本；尚未提交过词表为 null"
+    )
+    subjects: list[SubjectCountItem] = Field(
+        ..., description="非零计数的标准主题列表"
+    )
